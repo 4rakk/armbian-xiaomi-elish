@@ -48,3 +48,4 @@ jobs:
           flavor: ${{ matrix.FLAVOR }}
           release-id: ${{ needs.prepare_release.outputs.release_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_DESKTOP: 'yes'
