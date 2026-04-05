@@ -1,0 +1,174 @@
+name: Build Armbian for xiaomi-elish (Debian Trixie/Sid, GNOME/KDE) + Upload to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub Release tag to upload assets to (leave empty to auto-generate)"
+        required: false
+      prerelease:
+        description: "Mark the GitHub Release as prerelease"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: armbian-xiaomi-elish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [trixie]  # 选择 Debian Trixie（测试版）
+        desktop: [kde-plasma]  # 选择 KDE 桌面环境（也可以选择 gnome）
+
+    steps:
+      - name: Checkout this repo (optional userpatches live here)
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: descriptinc/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      # Fix cross-arch: register QEMU binfmt on the runner kernel
+      - name: Register binfmt interpreters (arm64/riscv64) on the runner
+        run: |
+          set -euxo pipefail
+          sudo docker run --privileged --rm multiarch/qemu-user-static --reset -p yes
+          # Sanity check (must specify platform)
+          sudo docker run --rm --platform linux/arm64 debian:bookworm-slim uname -m
+
+      - name: Checkout Armbian build framework
+        uses: actions/checkout@v4
+        with:
+          repository: armbian/build
+          path: build
+          fetch-depth: 0
+
+      - name: Install helper tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rsync
+
+      - name: Copy userpatches (if present)
+        run: |
+          set -euxo pipefail
+          if [ -d "./userpatches" ]; then
+            mkdir -p build/userpatches
+            rsync -av ./userpatches/ build/userpatches/
+          fi
+
+      # Ensure Armbian Docker runs privileged (safety net)
+      - name: Ensure Armbian Docker runs privileged (safety net)
+        run: |
+          set -euxo pipefail
+          mkdir -p build/userpatches
+          if [ ! -f build/userpatches/config-docker.conf ]; then
+            printf '%s\n' 'DOCKER_FLAGS+=(--privileged)' > build/userpatches/config-docker.conf
+          fi
+
+      # Build Armbian image
+      - name: Build image
+        working-directory: build
+        env:
+          TERM: xterm-256color
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euxo pipefail
+          ./compile.sh build \
+            BOARD=xiaomi-elish \
+            BRANCH=current \
+            RELEASE=${{ matrix.release }} \
+            BUILD_DESKTOP_ENVIRONMENT=${{ matrix.desktop }} \  # 修正为 BUILD_DESKTOP_ENVIRONMENT
+            KERNEL_CONFIGURE=no \
+            SHARE_LOG=yes \
+            EXPERT=yes
+
+      - name: Collect outputs (unique filenames)
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+
+          for f in build/output/images/*; do
+            base="$(basename "$f")"
+            cp -v "$f" "dist/${{ matrix.release }}-${{ matrix.desktop }}-${base}"
+          done
+
+          if [ -d build/output/logs ]; then
+            mkdir -p dist/logs
+            cp -v build/output/logs/* dist/logs/ || true
+          fi
+
+          ls -lah dist || true
+
+      - name: Upload images as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: armbian-xiaomi-elish-${{ matrix.release }}-${{ matrix.desktop }}
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create/Update GitHub Release and upload assets
+    runs-on: ubuntu-24.04
+    needs: build
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+
+      - name: Decide release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+          else
+            TAG="nightly-$(date -u +%Y%m%d)-run${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release (if missing) and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            FLAGS=()
+            if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+              FLAGS+=(--prerelease)
+            fi
+
+            gh release create "$TAG" \
+              --title "Armbian xiaomi-elish $TAG" \
+              --notes "Automated builds: Debian (trixie/sid) × Desktop (gnome/kde-plasma)" \
+              "${FLAGS[@]}"
+          fi
+
+          mapfile -t FILES < <(find dist-all -type f -print)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No files found to upload."
+            exit 1
+          fi
+
+          gh release upload "$TAG" "${FILES[@]}" --clobber
