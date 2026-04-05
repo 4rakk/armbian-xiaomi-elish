@@ -31,9 +31,10 @@ jobs:
     needs: prepare_release
     strategy:
       matrix:
-        BOARD: [xiaomi-elish, oneplus-kebab]
+        BOARD: [xiaomi-elish]
         DISTRO: [armbian]
-        FLAVOR: [ubuntu]
+        FLAVOR: [debian]
+        RELEASE: [trixie]
         BRANCH: [current]
     steps:
       - name: Checkout
